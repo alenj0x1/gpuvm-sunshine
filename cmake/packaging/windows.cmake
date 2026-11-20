@@ -100,4 +100,9 @@ set(CPACK_COMPONENT_FIREWALL_GROUP "Scripts")
 
 # include specific packaging
 include(${CMAKE_MODULE_PATH}/packaging/windows_nsis.cmake)
-include(${CMAKE_MODULE_PATH}/packaging/windows_wix.cmake)
+# GpuVM: the MSI isn't used (GpuVM installs upstream's MSI and adds its own executables); WiX would be fetched
+# from NuGet at every configure.
+option(GPUVM_SKIP_WIX "Skip WiX packaging" OFF)
+if(NOT GPUVM_SKIP_WIX)
+    include(${CMAKE_MODULE_PATH}/packaging/windows_wix.cmake)
+endif()

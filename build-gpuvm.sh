@@ -3,6 +3,6 @@
 # host's native Node.js on PATH (MSYS2_PATH_TYPE=inherit).
 set -e
 cd "$(dirname "$0")"
-cmake -B build -G Ninja -S . -DBUILD_DOCS=OFF -DBUILD_TESTS=OFF -DSUNSHINE_ENABLE_TRAY=OFF -DCMAKE_BUILD_TYPE=Release
+cmake -B build -G Ninja -S . -DBUILD_DOCS=OFF -DBUILD_TESTS=OFF -DSUNSHINE_ENABLE_TRAY=OFF -DGPUVM_SKIP_WIX=ON -DCMAKE_BUILD_TYPE=Release
 ninja -C build
 echo BUILD-OK

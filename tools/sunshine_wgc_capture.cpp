@@ -49,6 +49,10 @@
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 
+// GpuVM: upstream's logging.h doesn't export Boost.Log's severity keyword (it lives in logging.cpp).
+#include <boost/log/expressions.hpp>
+BOOST_LOG_ATTRIBUTE_KEYWORD(severity, "Severity", int)
+
 // Manual declaration for CreateDirect3D11DeviceFromDXGIDevice if missing
 extern "C" {
   HRESULT __stdcall CreateDirect3D11DeviceFromDXGIDevice(::IDXGIDevice *dxgiDevice, ::IInspectable **graphicsDevice);

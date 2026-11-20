@@ -60,3 +60,4 @@ venv/
 
 # GpuVM
 build-gpuvm.log
+build-target.log

@@ -47,3 +47,18 @@ target_link_libraries(sunshinesvc
         wtsapi32
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshinesvc PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+# GpuVM: Windows.Graphics.Capture helper (from Vibeshine). Sunshine, running as SYSTEM, starts it in the console
+# session with the signed-in user's token and reads its frames from a keyed-mutex shared texture.
+add_executable(sunshine_wgc_capture sunshine_wgc_capture.cpp
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/ipc/pipes.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/ipc/misc_utils.cpp"
+        ${TOOL_SOURCES})
+target_link_libraries(sunshine_wgc_capture
+        ${Boost_LIBRARIES}
+        ${CMAKE_THREAD_LIBS_INIT}
+        ${FFMPEG_LIBRARIES}  # this is included only for logging
+        libdisplaydevice::display_device  # this is included only for logging
+        d3d11 dxgi ole32 user32 gdi32 windowsapp avrt shcore wtsapi32 userenv
+        ${PLATFORM_LIBRARIES})
+target_compile_options(sunshine_wgc_capture PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
