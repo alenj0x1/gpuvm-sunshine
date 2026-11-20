@@ -349,6 +349,9 @@ namespace platf::dxgi {
     };
 
     auto anon_connector = std::make_unique<AnonymousPipeFactory>();
+    // GpuVM: the user's other processes can't create a second instance of the pipe (squatting), and no remote
+    // client is accepted. Handles always come from the real helper's handle table (DuplicateHandle on its process).
+    anon_connector->set_first_pipe_instance_only();
 
     auto control_pipe = anon_connector->create_server(pipe_guid, [this]() { return stop_requested(); });
     if (!control_pipe) {
