@@ -45,7 +45,8 @@ public:
    */
   bool start(
     const std::wstring &application_path,
-    std::wstring_view arguments
+    std::wstring_view arguments,
+    bool restrict_process_access = false
   );
 
   /**

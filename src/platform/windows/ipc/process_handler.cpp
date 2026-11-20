@@ -7,7 +7,9 @@
  * including support for attribute lists and impersonation as needed for the Sunshine project.
  *
  * GpuVM: a SYSTEM parent only ever starts children with the console user's non-elevated token (no SYSTEM
- * fallback), and their process object always denies that user (only SYSTEM and Administrators may open it).
+ * fallback). restrict_process_access denies that user its own child's process object; the WGC capture helper
+ * must not use it (Windows.Graphics.Capture then fails with E_HANDLE), and gains nothing from it: it holds nothing
+ * the user doesn't already control.
  */
 
 // local includes (include our header first to enforce correct include order)
@@ -40,7 +42,8 @@ ProcessHandler::ProcessHandler(bool use_job):
 
 bool ProcessHandler::start(
   const std::wstring &application_path,
-  std::wstring_view arguments
+  std::wstring_view arguments,
+  bool restrict_process_access
 ) {
   if (running_) {
     // Check if the previously started process has already exited. If so, clear stale state.
@@ -96,7 +99,7 @@ bool ProcessHandler::start(
   PSECURITY_DESCRIPTOR process_descriptor = nullptr;
   SECURITY_ATTRIBUTES process_attributes {sizeof(process_attributes), nullptr, FALSE};
   SECURITY_ATTRIBUTES *process_attributes_ptr = nullptr;
-  if (parent_is_system) {
+  if (parent_is_system && restrict_process_access) {
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
           L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)",
           SDDL_REVISION_1,
