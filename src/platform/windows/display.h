@@ -705,9 +705,42 @@ namespace platf::dxgi {
   };
 
   /**
+   * GpuVM: what display_wgc_*_t needs from a Windows.Graphics.Capture frame source, in-process (wgc_capture_t) or
+   * through the capture helper (wgc_ipc_capture_t).
+   */
+  class wgc_frame_source_t {
+  public:
+    virtual ~wgc_frame_source_t() = default;
+    virtual int init(display_base_t *display, const ::video::config_t &config) = 0;
+    virtual capture_e next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time) = 0;
+    virtual capture_e release_frame() = 0;
+    virtual int set_cursor_visible(bool cursor_visible) = 0;
+  };
+
+  class ipc_session_t;
+
+  /**
+   * GpuVM: Windows.Graphics.Capture through tools/sunshine_wgc_capture.exe (from Vibeshine). Windows only lets the
+   * console session's own user create a capture item, so when Sunshine runs as SYSTEM (the service) the helper runs
+   * with that user's token and hands frames over in a keyed-mutex shared texture.
+   */
+  class wgc_ipc_capture_t: public wgc_frame_source_t {
+    std::unique_ptr<ipc_session_t> ipc;
+    bool locked = false;
+
+  public:
+    wgc_ipc_capture_t();
+    ~wgc_ipc_capture_t() override;
+    int init(display_base_t *display, const ::video::config_t &config) override;
+    capture_e next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time) override;
+    capture_e release_frame() override;
+    int set_cursor_visible(bool cursor_visible) override;
+  };
+
+  /**
    * Display duplicator that uses the Windows.Graphics.Capture API.
    */
-  class wgc_capture_t {
+  class wgc_capture_t: public wgc_frame_source_t {
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice uwp_device {nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem item {nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool frame_pool {nullptr};
@@ -721,7 +754,7 @@ namespace platf::dxgi {
 
   public:
     wgc_capture_t();
-    ~wgc_capture_t();
+    ~wgc_capture_t() override;
 
     /**
      * @brief Initialize D3D cursor rendering resources for GPU capture.
@@ -730,7 +763,7 @@ namespace platf::dxgi {
      * @param config Configuration values to apply.
      * @return 0 on success; nonzero or negative platform status on failure.
      */
-    int init(display_base_t *display, const ::video::config_t &config);
+    int init(display_base_t *display, const ::video::config_t &config) override;
     /**
      * @brief Acquire the next frame from the Windows capture backend.
      *
@@ -739,27 +772,32 @@ namespace platf::dxgi {
      * @param out_time QPC timestamp associated with the acquired frame.
      * @return Capture status for the frame acquisition attempt.
      */
-    capture_e next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time);
+    capture_e next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time) override;
     /**
      * @brief Release resources associated with frame.
      *
      * @return Capture status after releasing the current frame.
      */
-    capture_e release_frame();
+    capture_e release_frame() override;
     /**
      * @brief Enable or disable cursor composition in Windows.Graphics.Capture frames.
      *
      * @param cursor_visible Whether the cursor should be included in captured frames.
      * @return Zero when the cursor visibility state was accepted by the capture session.
      */
-    int set_cursor_visible(bool cursor_visible);
+    int set_cursor_visible(bool cursor_visible) override;
   };
+
+  /**
+   * GpuVM: the capture helper when Sunshine runs as SYSTEM, otherwise WGC in this process.
+   */
+  std::unique_ptr<wgc_frame_source_t> make_wgc_frame_source();
 
   /**
    * Display backend that uses Windows.Graphics.Capture with a software encoder.
    */
   class display_wgc_ram_t: public display_ram_t {
-    wgc_capture_t dup;
+    std::unique_ptr<wgc_frame_source_t> dup;  ///< GpuVM: in-process WGC, or the capture helper as SYSTEM
 
   public:
     /**
@@ -792,7 +830,7 @@ namespace platf::dxgi {
    * Display backend that uses Windows.Graphics.Capture with a hardware encoder.
    */
   class display_wgc_vram_t: public display_vram_t {
-    wgc_capture_t dup;
+    std::unique_ptr<wgc_frame_source_t> dup;  ///< GpuVM: in-process WGC, or the capture helper as SYSTEM
 
   public:
     /**

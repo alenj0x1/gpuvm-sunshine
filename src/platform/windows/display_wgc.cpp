@@ -2,11 +2,15 @@
  * @file src/platform/windows/display_wgc.cpp
  * @brief Definitions for WinRT Windows.Graphics.Capture API
  */
+// GpuVM: first, so winsock2 comes before windows.h (pipes.h).
+#include "ipc/ipc_session.h"
+
 // platform includes
 #include <dxgi1_2.h>
 
 // local includes
 #include "display.h"
+#include "src/platform/windows/utf_utils.h"
 #include "misc.h"
 #include "src/logging.h"
 
@@ -252,8 +256,78 @@ namespace platf::dxgi {
     }
   }
 
+  wgc_ipc_capture_t::wgc_ipc_capture_t() = default;
+
+  wgc_ipc_capture_t::~wgc_ipc_capture_t() {
+    release_frame();
+    ipc.reset();  // stops the helper (TerminateProcess, waits up to 3 s)
+  }
+
+  int wgc_ipc_capture_t::init(display_base_t *display, const ::video::config_t &config) {
+    // Always the output Sunshine picked: with an empty name the helper would take the primary monitor, which can
+    // be another one.
+    DXGI_OUTPUT_DESC output_desc {};
+    display->output->GetDesc(&output_desc);
+    const auto output_name = utf_utils::to_utf8(output_desc.DeviceName);
+
+    ipc = std::make_unique<ipc_session_t>();
+    if (ipc->init(config, output_name, display->device.get(), false)) {
+      BOOST_LOG(error) << "WGC helper: couldn't set up the IPC session"sv;
+      return -1;
+    }
+    // The helper picks this format when the display isn't in advanced color.
+    display->capture_format = config.dynamicRange ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+    // Started now, so a failure (no signed-in user, helper missing) ends this backend's init cleanly.
+    ipc->initialize_if_needed();
+    if (!ipc->is_initialized()) {
+      BOOST_LOG(error) << "WGC helper: didn't start for "sv << output_name;
+      return -1;
+    }
+    BOOST_LOG(info) << "WGC helper: capturing "sv << output_name << " in the console user's session"sv;
+    return 0;
+  }
+
+  capture_e wgc_ipc_capture_t::next_frame(std::chrono::milliseconds timeout, ID3D11Texture2D **out, uint64_t &out_time) {
+    release_frame();
+    if (ipc->should_reinit() || ipc->should_swap_to_dxgi()) {
+      return capture_e::reinit;
+    }
+    winrt::com_ptr<ID3D11Texture2D> texture;
+    auto status = ipc->acquire(timeout, texture, out_time);
+    if (status != capture_e::ok) {
+      return status;
+    }
+    *out = texture.detach();
+    locked = true;
+    return capture_e::ok;
+  }
+
+  capture_e wgc_ipc_capture_t::release_frame() {
+    if (locked && ipc) {
+      ipc->release();
+    }
+    locked = false;
+    return capture_e::ok;
+  }
+
+  int wgc_ipc_capture_t::set_cursor_visible(bool cursor_visible) {
+    return ipc && ipc->set_cursor_visible(cursor_visible) ? 0 : -1;
+  }
+
+  /**
+   * GpuVM: the capture helper when Sunshine runs as SYSTEM (WGC refuses SYSTEM and any user but the session's own),
+   * otherwise WGC in this process.
+   */
+  std::unique_ptr<wgc_frame_source_t> make_wgc_frame_source() {
+    if (is_running_as_system()) {
+      return std::make_unique<wgc_ipc_capture_t>();
+    }
+    return std::make_unique<wgc_capture_t>();
+  }
+
   int display_wgc_ram_t::init(const ::video::config_t &config, const std::string &display_name) {
-    if (display_base_t::init(config, display_name) || dup.init(this, config)) {
+    dup = make_wgc_frame_source();
+    if (display_base_t::init(config, display_name) || dup->init(this, config)) {
       return -1;
     }
 
@@ -268,8 +342,8 @@ namespace platf::dxgi {
     HRESULT status;
     texture2d_t src;
     uint64_t frame_qpc;
-    dup.set_cursor_visible(cursor_visible);
-    auto capture_status = dup.next_frame(timeout, &src, frame_qpc);
+    dup->set_cursor_visible(cursor_visible);
+    auto capture_status = dup->next_frame(timeout, &src, frame_qpc);
     if (capture_status != capture_e::ok) {
       return capture_status;
     }
@@ -316,6 +390,8 @@ namespace platf::dxgi {
 
     // Copy from GPU to CPU
     device_ctx->CopyResource(texture.get(), src.get());
+    // GpuVM: the helper's keyed mutex isn't held while waiting for a free image.
+    dup->release_frame();
 
     if (!pull_free_image_cb(img_out)) {
       return capture_e::interrupted;
@@ -350,6 +426,6 @@ namespace platf::dxgi {
   }
 
   capture_e display_wgc_ram_t::release_snapshot() {
-    return dup.release_frame();
+    return dup ? dup->release_frame() : capture_e::ok;
   }
 }  // namespace platf::dxgi
