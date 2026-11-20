@@ -5,6 +5,9 @@
  *
  * This file provides the implementation for starting, waiting, and terminating processes,
  * including support for attribute lists and impersonation as needed for the Sunshine project.
+ *
+ * GpuVM: a SYSTEM parent only ever starts children with the console user's non-elevated token (no SYSTEM
+ * fallback), and their process object always denies that user (only SYSTEM and Administrators may open it).
  */
 
 // local includes (include our header first to enforce correct include order)
@@ -18,7 +21,6 @@
 
 // standard includes
 #include "src/logging.h"
-#include "src/platform/windows/misc.h"
 #include "src/utility.h"
 
 #include <algorithm>
@@ -26,112 +28,7 @@
 #include <system_error>
 #include <vector>
 
-namespace {
 
-  constexpr wchar_t kDefaultDesktopW[] = L"winsta0\\default";
-  constexpr wchar_t kWinlogonDesktopW[] = L"winsta0\\winlogon";
-
-  bool start_as_system_in_active_console_session(
-    const std::wstring &cmd_line,
-    const std::wstring &working_dir,
-    DWORD creation_flags,
-    STARTUPINFOW &si,
-    bool inherit_handles,
-    SECURITY_ATTRIBUTES *process_attributes,
-    PROCESS_INFORMATION &pi
-  ) {
-    const DWORD session_id = WTSGetActiveConsoleSessionId();
-    if (session_id == 0xFFFFFFFF) {
-      BOOST_LOG(debug) << "Active console session id unavailable; cannot launch SYSTEM child in active session.";
-      return false;
-    }
-
-    HANDLE raw_process_token = nullptr;
-    if (!OpenProcessToken(
-          GetCurrentProcess(),
-          TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY | TOKEN_ADJUST_SESSIONID,
-          &raw_process_token
-        )) {
-      BOOST_LOG(debug) << "OpenProcessToken failed while launching SYSTEM child in active session, winerr=" << GetLastError();
-      return false;
-    }
-    auto close_process_token = util::fail_guard([&]() {
-      CloseHandle(raw_process_token);
-    });
-
-    HANDLE raw_primary_token = nullptr;
-    if (!DuplicateTokenEx(
-          raw_process_token,
-          MAXIMUM_ALLOWED,
-          nullptr,
-          SecurityImpersonation,
-          TokenPrimary,
-          &raw_primary_token
-        )) {
-      BOOST_LOG(debug) << "DuplicateTokenEx failed while launching SYSTEM child in active session, winerr=" << GetLastError();
-      return false;
-    }
-    auto close_primary_token = util::fail_guard([&]() {
-      CloseHandle(raw_primary_token);
-    });
-
-    if (!SetTokenInformation(raw_primary_token, TokenSessionId, (PVOID) &session_id, sizeof(session_id))) {
-      BOOST_LOG(debug) << "SetTokenInformation(TokenSessionId=" << session_id
-                       << ") failed while launching SYSTEM child in active session, winerr=" << GetLastError();
-      return false;
-    }
-
-    void *env_block = nullptr;
-    if (!CreateEnvironmentBlock(&env_block, raw_primary_token, FALSE)) {
-      BOOST_LOG(debug) << "CreateEnvironmentBlock failed while launching SYSTEM child in active session, winerr=" << GetLastError();
-      env_block = nullptr;
-    }
-    auto destroy_env = util::fail_guard([&]() {
-      if (env_block) {
-        DestroyEnvironmentBlock(env_block);
-      }
-    });
-
-    // Ensure the child runs on the interactive window station/desktop for the active console session.
-    auto *prev_desktop = si.lpDesktop;
-    const auto try_launch = [&](const wchar_t *desktop) {
-      si.lpDesktop = const_cast<LPWSTR>(desktop);
-      return CreateProcessAsUserW(
-        raw_primary_token,
-        nullptr,
-        (LPWSTR) cmd_line.c_str(),
-        process_attributes,
-        process_attributes,
-        inherit_handles,
-        creation_flags,
-        env_block,
-        working_dir.empty() ? nullptr : working_dir.c_str(),
-        (LPSTARTUPINFOW) &si,
-        &pi
-      );
-    };
-
-    // Prefer the user's default desktop, but fall back to Winlogon if required (e.g. lock/login screen).
-    BOOL ok = try_launch(kDefaultDesktopW);
-    const wchar_t *launched_desktop = kDefaultDesktopW;
-    if (!ok) {
-      ok = try_launch(kWinlogonDesktopW);
-      launched_desktop = kWinlogonDesktopW;
-    }
-
-    si.lpDesktop = prev_desktop;
-    if (!ok) {
-      BOOST_LOG(debug) << "CreateProcessAsUserW failed while launching SYSTEM child in active session (session_id="
-                       << session_id << "), winerr=" << GetLastError();
-    } else {
-      BOOST_LOG(info) << "Launched SYSTEM child in active console session (session_id=" << session_id
-                      << ", pid=" << pi.dwProcessId << ", desktop=" << (launched_desktop == kDefaultDesktopW ? "default" : "winlogon")
-                      << ").";
-    }
-    return ok;
-  }
-
-}  // namespace
 
 ProcessHandler::ProcessHandler():
     job_(create_kill_on_close_job()),
@@ -143,9 +40,7 @@ ProcessHandler::ProcessHandler(bool use_job):
 
 bool ProcessHandler::start(
   const std::wstring &application_path,
-  std::wstring_view arguments,
-  bool allow_system_fallback,
-  bool restrict_process_access
+  std::wstring_view arguments
 ) {
   if (running_) {
     // Check if the previously started process has already exited. If so, clear stale state.
@@ -184,7 +79,7 @@ bool ProcessHandler::start(
     cmd_line.append(arguments);
   }
 
-  BOOST_LOG(debug) << "Launching process: " << platf::to_utf8(application_path)
+  BOOST_LOG(debug) << "Launching process: " << platf::dxgi::wide_to_utf8(application_path)
                    << (arguments.empty() ? "" : " with arguments") << " (hidden, detached)";
 
   STARTUPINFOW si = {};
@@ -192,7 +87,7 @@ bool ProcessHandler::start(
 
   // Windows does not support inheriting handles across sessions.
   const BOOL inherit_handles = FALSE;
-  const bool parent_is_system = platf::is_running_as_system();
+  const bool parent_is_system = platf::dxgi::is_running_as_system();
 
   // A helper accepting privileged commands runs with the interactive
   // user's token, so its process object must not grant that user
@@ -201,7 +96,7 @@ bool ProcessHandler::start(
   PSECURITY_DESCRIPTOR process_descriptor = nullptr;
   SECURITY_ATTRIBUTES process_attributes {sizeof(process_attributes), nullptr, FALSE};
   SECURITY_ATTRIBUTES *process_attributes_ptr = nullptr;
-  if (parent_is_system && restrict_process_access) {
+  if (parent_is_system) {
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
           L"O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)",
           SDDL_REVISION_1,
@@ -236,7 +131,7 @@ bool ProcessHandler::start(
   BOOL ret = FALSE;
 
   if (parent_is_system) {
-    HANDLE user_token = platf::retrieve_users_token(false);
+    HANDLE user_token = platf::dxgi::retrieve_users_token(false);
     if (user_token) {
       auto close_token = util::fail_guard([&]() {
         CloseHandle(user_token);
@@ -268,36 +163,8 @@ bool ProcessHandler::start(
         (LPSTARTUPINFOW) &si,
         &pi_
       );
-    } else if (allow_system_fallback) {
-      BOOST_LOG(warning) << "No user session available; launching as SYSTEM: " << platf::to_utf8(application_path);
-
-      // Prefer launching into the active console session so display APIs (e.g., SetDisplayConfig)
-      // have a better chance of working while Sunshine runs as a service.
-      if (start_as_system_in_active_console_session(
-            cmd_line,
-            working_dir,
-            creation_flags,
-            si,
-            inherit_handles != FALSE,
-            process_attributes_ptr,
-            pi_)) {
-        ret = TRUE;
-      } else {
-        ret = CreateProcessW(
-          nullptr,
-          (LPWSTR) cmd_line.c_str(),
-          process_attributes_ptr,
-          process_attributes_ptr,
-          inherit_handles,
-          creation_flags,
-          nullptr,
-          working_dir.empty() ? nullptr : working_dir.c_str(),
-          (LPSTARTUPINFOW) &si,
-          &pi_
-        );
-      }
     } else {
-      BOOST_LOG(error) << "Failed to retrieve user token while launching: " << platf::to_utf8(application_path);
+      BOOST_LOG(error) << "Failed to retrieve user token while launching: " << platf::dxgi::wide_to_utf8(application_path);
       return false;
     }
   } else {
@@ -323,7 +190,7 @@ bool ProcessHandler::start(
   running_ = ret;
   if (!running_) {
     auto winerr = GetLastError();
-    BOOST_LOG(error) << "Failed to launch process: " << platf::to_utf8(application_path) << ", error: " << winerr;
+    BOOST_LOG(error) << "Failed to launch process: " << platf::dxgi::wide_to_utf8(application_path) << ", error: " << winerr;
     ZeroMemory(&pi_, sizeof(pi_));
   }
   if (running_) {

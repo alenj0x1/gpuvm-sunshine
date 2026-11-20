@@ -17,12 +17,11 @@
 #include <thread>
 
 // local includes
-#include "config.h"
+#include "src/config.h"
 #include "ipc_session.h"
 #include "misc_utils.h"
 #include "src/logging.h"
-#include "src/platform/windows/display.h"
-#include "src/platform/windows/misc.h"
+#include "src/platform/windows/utf_utils.h"
 #include "src/platform/windows/wgc_capture_policy.h"
 #include "src/utility.h"
 
@@ -32,6 +31,8 @@
 #include <d3d11_1.h>
 #include <dxgi1_6.h>
 #include <winrt/base.h>
+
+using namespace std::literals;
 
 namespace platf::dxgi {
   namespace {
@@ -81,16 +82,11 @@ namespace platf::dxgi {
       return kWgcMinUpdateInterval100ns;
     }
 
-    uint32_t wgc_ipc_flags(const ::video::config_t &config) {
+    uint32_t wgc_ipc_flags(const ::video::config_t & /*config*/) {
       // Keep WGC latency-first when the helper is keeping up. If producer
       // backpressure appears, the helper can grow to a second frame, drain stale
       // queued WGC frames, then shrink back after a quiet period.
       auto flags = kWgcAdaptiveFramePoolFlags;
-      if (config.rtx_hdr_active) {
-        // TrueHDR generates the HDR frame itself. Keep the stream HDR, but ask WGC
-        // for an SDR-compatible UNORM frame pool so the NGX TrueHDR input accepts it.
-        flags |= WGC_IPC_FLAG_FORCE_SDR_CAPTURE_FORMAT;
-      }
       return flags;
     }
 
@@ -98,10 +94,10 @@ namespace platf::dxgi {
       return wgc_policy::low_latency_initial_buffer_size;
     }
 
-    uint32_t wgc_max_frame_buffer_size(const ::video::config_t &config) {
+    uint32_t wgc_max_frame_buffer_size(const ::video::config_t & /*config*/) {
       // A launch-qualified VRR session explicitly trades burst resilience for
       // newest-frame latency. Other sessions retain adaptive growth to two.
-      return wgc_policy::maximum_buffer_size(config.vrr_low_latency);
+      return wgc_policy::maximum_buffer_size(false);  // GpuVM: upstream has no VRR low-latency launch
     }
 
     struct frame_metadata_snapshot_t {
@@ -361,7 +357,7 @@ namespace platf::dxgi {
     }
 
     std::filesystem::path exe_path = mainExeDir / L"tools" / L"sunshine_wgc_capture.exe";
-    std::wstring arguments = platf::from_utf8(pipe_guid);
+    std::wstring arguments = utf_utils::from_utf8(pipe_guid);
 
     if (!_process_helper->start(exe_path.wstring(), arguments)) {
       auto err = GetLastError();
@@ -393,7 +389,7 @@ namespace platf::dxgi {
     // different capture path. `force_sdr` is an explicit HDR-off override, so
     // it must suppress the HDR pool too; every other effective-HDR predicate
     // in the tree excludes both flags.
-    config_data.dynamic_range = _config.dynamicRange && !_config.prefer_sdr_10bit && !_config.force_sdr;
+    config_data.dynamic_range = _config.dynamicRange;
     config_data.advanced_color_capture = _advanced_color_capture ? 1u : 0u;
     config_data.log_level = config::sunshine.min_log_level;
     config_data.min_update_interval_100ns = wgc_min_update_interval_100ns(_config);
@@ -693,7 +689,6 @@ namespace platf::dxgi {
     }
 
     luid_out = desc.AdapterLuid;
-    set_last_wgc_adapter_luid(luid_out, _display_name);
     return true;
   }
 
