@@ -36,6 +36,7 @@
 
 // platform includes
 #include <d3d11.h>
+#include <d3d11_4.h>  // GpuVM: ID3D11Multithread
 #include <dxgi1_2.h>
 #include <inspectable.h>  // For IInspectable
 #include <KnownFolders.h>
@@ -170,6 +171,16 @@ static bool g_secure_desktop_detected = false;
  * helper must exit and let the main process reinitialize capture.
  */
 static std::atomic<bool> g_capture_item_closed {false};
+
+// GpuVM stall probe: where each thread is, and when the last frame arrived, for a watchdog that logs them when
+// frames stop (lab 056).
+static std::atomic<const char *> g_stage_cb {"init"};
+static std::atomic<const char *> g_stage_dl {"init"};
+static std::atomic<const char *> g_stage_main {"init"};
+static std::atomic<int64_t> g_last_frame_ms {0};
+static int64_t gpuvm_now_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 /**
  * @brief Pending verification deadline for desktop switches that were not immediately secure.
@@ -529,6 +540,16 @@ public:
     if (FAILED(hr)) {
       BOOST_LOG(error) << "Failed to create D3D11 device: " << std::hex << hr << std::dec;
       return false;
+    }
+
+    // GpuVM: the free-threaded WGC frame pool, the FrameArrived callback and the delivery thread all use this
+    // device and its immediate context; without multithread protection the driver could hang between them
+    // (lab 056: frames stopped for good after 1-2.5 min on a GPU-P virtual display).
+    if (auto multithread = _device.try_as<ID3D11Multithread>()) {
+      multithread->SetMultithreadProtected(TRUE);
+      BOOST_LOG(info) << "D3D11 multithread protection enabled";
+    } else {
+      BOOST_LOG(warning) << "ID3D11Multithread not available; the device isn't multithread protected";
     }
 
     // Set GPU thread priority to 7 for optimal capture performance under high GPU load
@@ -1362,6 +1383,9 @@ public:
 
     Direct3D11CaptureFrame frame = nullptr;
     uint32_t drained_frames = 0;
+    g_stage_cb = "cb:enter";
+    g_last_frame_ms = gpuvm_now_ms();
+    auto stage_done = util::fail_guard([]() { g_stage_cb = "cb:done"; });
 
     try {
       if (drain_to_latest()) {
@@ -1772,7 +1796,9 @@ private:
    * @return true if the frame was published.
    */
   bool try_publish_directly(const winrt::com_ptr<ID3D11Texture2D> &frame_tex, uint64_t frame_qpc) {
+    g_stage_cb = "cb:pub-delivery-mutex";
     std::unique_lock delivery_lock(_delivery_mutex);
+    g_stage_cb = "cb:pub-checks";
     const bool frame_delivering = std::any_of(_scratch_textures.begin(), _scratch_textures.end(), [](const auto &scratch) {
       return scratch.state == scratch_state_e::delivering;
     });
@@ -1797,11 +1823,15 @@ private:
       BOOST_LOG(error) << "Keyed mutex was abandoned; continuing with lock held";
     }
 
+    g_stage_cb = "cb:pub-copy";
     _deps->d3d_context->CopyResource(_deps->resource_manager.get_shared_texture().get(), frame_tex.get());
+    g_stage_cb = "cb:pub-metadata";
     _deps->resource_manager.publish_frame_metadata(frame_qpc);
+    g_stage_cb = "cb:pub-release";
     const HRESULT release_hr = keyed_mutex->ReleaseSync(0);
     context_lock.unlock();
     delivery_lock.unlock();
+    g_stage_cb = "cb:pub-signal";
     if (FAILED(release_hr)) {
       BOOST_LOG(warning) << "Failed to release mutex key 0: " << std::format(": 0x{:08X}", release_hr);
       return true;
@@ -1842,20 +1872,25 @@ private:
       return;
     }
 
+    g_stage_cb = "cb:scratch-reserve";
     auto scratch_index = reserve_scratch_texture();
     if (!scratch_index) {
       return;
     }
 
+    g_stage_cb = "cb:scratch-ensure";
     if (!ensure_scratch_texture(*scratch_index)) {
       release_reserved_scratch_texture(*scratch_index);
       return;
     }
 
     {
+      g_stage_cb = "cb:scratch-context-mutex";
       std::lock_guard context_lock(_d3d_context_mutex);
+      g_stage_cb = "cb:scratch-copy";
       _deps->d3d_context->CopyResource(_scratch_textures[*scratch_index].texture.get(), frame_tex.get());
     }
+    g_stage_cb = "cb:scratch-enqueue";
 
     // From here on the delivery thread owns only the helper scratch texture, not
     // the Direct3D11CaptureFrame/WGC frame-pool buffer. The helper can wait for
@@ -1887,6 +1922,7 @@ private:
     for (;;) {
       std::optional<delivery_frame_t> frame;
       {
+        g_stage_dl = "dl:wait";
         std::unique_lock lock(_delivery_mutex);
         _delivery_cv.wait(lock, [&]() {
           return _delivery_stop || stop_token.stop_requested() || _pending_delivery_frame.has_value();
@@ -1909,7 +1945,9 @@ private:
       }
 
       try {
+        g_stage_dl = "dl:copy";
         copy_frame_to_shared_texture(frame->texture, frame->frame_qpc);
+        g_stage_dl = "dl:copied";
       } catch (const winrt::hresult_error &ex) {
         BOOST_LOG(error) << "WinRT error in WGC delivery thread: " << ex.code() << " - " << winrt::to_string(ex.message());
       } catch (...) {
@@ -1959,7 +1997,9 @@ private:
         break;
       }
       const auto remaining_ms = std::chrono::ceil<std::chrono::milliseconds>(acquire_deadline - now).count();
+      g_stage_dl = "dl:acquire-sync";
       hr = keyed_mutex->AcquireSync(0, static_cast<DWORD>(remaining_ms));
+      g_stage_dl = "dl:acquired";
       if ((hr != S_OK && hr != WAIT_ABANDONED) || context_lock.try_lock()) {
         break;
       }
@@ -1971,6 +2011,7 @@ private:
       }
       const auto context_wait_start = std::chrono::steady_clock::now();
       {
+        g_stage_dl = "dl:wait-context";
         std::lock_guard wait_for_callback_copy(_d3d_context_mutex);
       }
       context_wait += std::chrono::steady_clock::now() - context_wait_start;
@@ -2686,14 +2727,48 @@ int main(int argc, char *argv[]) {
 
   // Main message loop
   bool shutdown_requested = false;
+  // GpuVM stall probe: logs where every thread is once frames stop for 2 s (lab 056).
+  std::jthread stall_probe([](std::stop_token st) {
+    int64_t last_report = 0;
+    while (!st.stop_requested()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      const auto last = g_last_frame_ms.load();
+      const auto now = gpuvm_now_ms();
+      if (last && now - last > 2000 && now - last_report > 10000) {
+        last_report = now;
+        BOOST_LOG(info) << "GpuVM stall probe: no FrameArrived for " << (now - last) << " ms; callback=" << g_stage_cb.load()
+                        << " delivery=" << g_stage_dl.load() << " main=" << g_stage_main.load();
+      }
+      // A thread stuck inside a copy or a lock (not idle waiting for frames) for 5 s won't come back: the helper
+      // exits like on a closed capture item, and Sunshine starts a new one (a picture again in ~1 s instead of a
+      // frozen one for good). An idle helper on a still screen (callback done, delivery waiting) is left alone.
+      const std::string_view cb = g_stage_cb.load();
+      const std::string_view dl = g_stage_dl.load();
+      const bool idle = (cb == "cb:done" || cb == "init") && (dl == "dl:wait" || dl == "dl:copied" || dl == "init");
+      if (last && now - last > 5000 && !idle) {
+        BOOST_LOG(warning) << "GpuVM stall probe: capture stuck for " << (now - last) << " ms (callback=" << cb
+                           << " delivery=" << dl << "); restarting the helper";
+        boost::log::core::get()->flush();
+        g_capture_item_closed.store(true, std::memory_order_release);
+        // The stuck thread may never let the normal shutdown finish: end the process outright.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        TerminateProcess(GetCurrentProcess(), 3);
+      }
+    }
+  });
+
   while (pipe_shared->is_connected() && !shutdown_requested && !g_capture_item_closed.load(std::memory_order_acquire)) {
     // Process window messages and check for shutdown
+    g_stage_main = "main:messages";
     if (!process_window_messages(shutdown_requested)) {
       break;
     }
 
+    g_stage_main = "main:secure-desktop-poll";
     poll_pending_secure_desktop_transition();
+    g_stage_main = "main:cursor-capture";
     wgc_capture_manager.update_cursor_capture();
+    g_stage_main = "main:sleep";
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1));  // Reduced from 5ms for lower IPC jitter
   }
