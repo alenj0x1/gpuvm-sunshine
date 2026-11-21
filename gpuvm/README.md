@@ -1,8 +1,10 @@
+English | [Español](README.es.md)
+
 # GpuVM Sunshine
 
 GpuVM's Sunshine is a fork of [Sunshine](https://github.com/LizardByte/Sunshine) (GPL-3.0) at `v2026.914.233613`.
-GpuVM still installs upstream's MSI in every VM; on agent machines it adds two files from this fork. Everything
-else stays as upstream wrote it.
+GpuVM installs upstream's MSI in every machine and then puts two files from this fork over it: `sunshine.exe` and
+`tools\sunshine_wgc_capture.exe`. Everything else stays as upstream wrote it.
 
 ## Why
 
@@ -23,6 +25,21 @@ SYSTEM service capture with WGC through a small helper that runs as the signed-i
 | `build-gpuvm.*`, `build-target.sh` | Build in MSYS2 UCRT64: no docs, tests or tray (no UI of a SYSTEM process on the user's desktop). |
 
 The first commit after the upstream tag imports Vibeshine's files unmodified; the following ones show every change.
+
+### Changes to the helper
+
+- **Multithread-protected D3D11 device.** The free-threaded frame pool, the FrameArrived callback and the delivery
+  thread share one device; without protection the capture stopped for good after 1-2.5 minutes on a GPU-P virtual
+  display.
+- **Stall watchdog.** A thread stuck inside a copy or a lock for 5 s ends the helper, and Sunshine starts a new one
+  (a picture again in about a second instead of a frozen one). An idle helper on a still screen is left alone.
+- **Capture broker watch.** WGC sessions live in Windows' per-user `CaptureService`. When it crashes, Windows restarts
+  it, but a session opened before gets no Closed event and no frames. The helper notes the service's process when the
+  capture starts and starts over when it changes (picture back in about 2 s).
+- **Copy finished before the frame goes back.** Each copy out of a WGC buffer waits for the GPU (an event query, at
+  most 50 ms) before the frame is released, so Windows doesn't draw the next frame into a buffer still being copied.
+- **One log per run.** `%APPDATA%\Sunshine\wgc-helper\helper-<date>-<pid>.log`, the newest 40 kept (Sunshine starts the
+  helper several times while a viewer opens).
 
 ## Build (Windows)
 

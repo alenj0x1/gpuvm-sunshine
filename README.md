@@ -1,3 +1,7 @@
+> **GpuVM's fork of Sunshine.** It adds a WGC capture helper so Sunshine running as a Windows service can capture
+> GPU-P virtual displays. What changes and how to build it: [gpuvm/README.md](gpuvm/README.md)
+> ([Español](gpuvm/README.es.md)). Below is upstream's README.
+
 <div align="center">
   <img
     src="sunshine.svg"
