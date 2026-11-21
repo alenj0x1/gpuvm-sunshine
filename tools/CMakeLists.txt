@@ -59,6 +59,6 @@ target_link_libraries(sunshine_wgc_capture
         ${CMAKE_THREAD_LIBS_INIT}
         ${FFMPEG_LIBRARIES}  # this is included only for logging
         libdisplaydevice::display_device  # this is included only for logging
-        d3d11 dxgi ole32 user32 gdi32 windowsapp avrt shcore wtsapi32 userenv
+        d3d11 dxgi ole32 user32 gdi32 windowsapp avrt shcore wtsapi32 userenv advapi32
         ${PLATFORM_LIBRARIES})
 target_compile_options(sunshine_wgc_capture PRIVATE ${SUNSHINE_COMPILE_OPTIONS})

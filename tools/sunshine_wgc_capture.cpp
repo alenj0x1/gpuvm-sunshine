@@ -14,6 +14,7 @@
 // standard includes
 #include <atomic>
 #include <algorithm>
+#include <fstream>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -44,6 +45,13 @@
 #include <ShlObj.h>
 #include <Windows.Graphics.Capture.Interop.h>
 #include <Windows.h>
+#include <winsvc.h>  // GpuVM: the capture broker watch
+#ifndef SERVICE_USER_SERVICE
+  #define SERVICE_USER_SERVICE 0x00000040
+#endif
+#ifndef SERVICE_USERSERVICE_INSTANCE
+  #define SERVICE_USERSERVICE_INSTANCE 0x00000080
+#endif
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Metadata.h>  // For ApiInformation
@@ -180,6 +188,57 @@ static std::atomic<const char *> g_stage_main {"init"};
 static std::atomic<int64_t> g_last_frame_ms {0};
 static int64_t gpuvm_now_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/**
+ * @brief GpuVM: the processes of Windows' capture broker (the per-user CaptureService_<id> instances), as a sorted
+ * list of their process ids; empty when none runs or they can't be listed.
+ *
+ * WGC sessions live in that service. When it crashes Windows restarts it after 10 s, but a session opened before
+ * gets no Closed event and no frames: the stream showed the last frame for good while the screen changed (GpuVM
+ * lab 057: captureservice.dll access violation on a Windows 10 19045 guest, the viewer frozen until reopened).
+ */
+static std::vector<DWORD> gpuvm_capture_service_pids() {
+  std::vector<DWORD> pids;
+  SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
+  if (!scm) {
+    return pids;
+  }
+  DWORD needed = 0;
+  DWORD count = 0;
+  DWORD resume = 0;
+  std::vector<BYTE> buffer;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    BOOL ok = EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32 | SERVICE_USER_SERVICE | SERVICE_USERSERVICE_INSTANCE,
+                                    SERVICE_ACTIVE, buffer.empty() ? nullptr : buffer.data(), static_cast<DWORD>(buffer.size()),
+                                    &needed, &count, &resume, nullptr);
+    if (ok) {
+      const auto *services = reinterpret_cast<const ENUM_SERVICE_STATUS_PROCESSW *>(buffer.data());
+      for (DWORD i = 0; i < count; ++i) {
+        const std::wstring_view name = services[i].lpServiceName;
+        if (name.starts_with(L"CaptureService_") && services[i].ServiceStatusProcess.dwProcessId) {
+          pids.push_back(services[i].ServiceStatusProcess.dwProcessId);
+        }
+      }
+      break;
+    }
+    if (GetLastError() != ERROR_MORE_DATA) {
+      break;
+    }
+    buffer.resize(needed + 4096);
+    resume = 0;
+  }
+  CloseServiceHandle(scm);
+  std::sort(pids.begin(), pids.end());
+  return pids;
+}
+
+static std::string gpuvm_pids_text(const std::vector<DWORD> &pids) {
+  std::string text;
+  for (const auto pid : pids) {
+    text += (text.empty() ? "" : ",") + std::to_string(pid);
+  }
+  return text.empty() ? "none" : text;
 }
 
 /**
@@ -1134,6 +1193,12 @@ private:
   std::atomic<uint64_t> _slow_copy_submissions {0};
   std::atomic<uint64_t> _published_frames {0};
   std::atomic<uint64_t> _direct_published_frames {0};  ///< Frames copied straight into the shared texture.
+  // GpuVM: the wait for each copy out of a WGC buffer to finish on the GPU before the buffer goes back (lab 057).
+  winrt::com_ptr<ID3D11Query> _gpuvm_copy_query;
+  std::atomic<uint64_t> _gpuvm_copy_waits {0};
+  std::atomic<uint64_t> _gpuvm_copy_wait_us {0};
+  std::atomic<uint64_t> _gpuvm_copy_wait_max_us {0};
+  std::atomic<uint64_t> _gpuvm_copy_wait_timeouts {0};
   std::atomic<uint64_t> _activity_rate_limited_frames {0};
   uint64_t _last_diagnostics_captured_frames = 0;
   uint64_t _last_diagnostics_published_frames = 0;
@@ -1569,6 +1634,11 @@ private:
                       << " slow_mutex=" << slow_mutex_delta
                       << " slow_shared_hold=" << slow_hold_delta
                       << " slow_copy=" << slow_copy_delta;
+      const auto waits = _gpuvm_copy_waits.exchange(0, std::memory_order_relaxed);
+      const auto wait_us = _gpuvm_copy_wait_us.exchange(0, std::memory_order_relaxed);
+      BOOST_LOG(info) << "GpuVM copy wait: copies=" << waits << " avg_us=" << (waits ? wait_us / waits : 0)
+                      << " max_us=" << _gpuvm_copy_wait_max_us.exchange(0, std::memory_order_relaxed)
+                      << " timeouts=" << _gpuvm_copy_wait_timeouts.exchange(0, std::memory_order_relaxed);
       return;
     }
   }
@@ -1795,6 +1865,42 @@ private:
    *          falls back to the scratch path, which keeps publication order and never blocks.
    * @return true if the frame was published.
    */
+  /**
+   * @brief GpuVM: waits (up to 50 ms) for the copies queued so far on the helper's context to finish on the GPU.
+   *
+   * A WGC frame's buffer goes back to the frame pool when the frame is released, and Windows renders the next
+   * frame into it. The copies out of it were only queued, not done: on a GPU-P virtual display the encoder got
+   * frames black from some line down, or wholly black, about one in 400 (lab 057: 56 in 2 min of a 180 fps
+   * stream, each fixed by the next frame). Called with the context lock held, right after such a copy.
+   */
+  void wait_for_copy_on_gpu() {
+    auto &ctx = _deps->d3d_context;
+    if (!_gpuvm_copy_query) {
+      winrt::com_ptr<ID3D11Device> device;
+      ctx->GetDevice(device.put());
+      D3D11_QUERY_DESC desc {D3D11_QUERY_EVENT, 0};
+      if (!device || FAILED(device->CreateQuery(&desc, _gpuvm_copy_query.put()))) {
+        return;
+      }
+    }
+    const auto start = std::chrono::steady_clock::now();
+    ctx->End(_gpuvm_copy_query.get());
+    BOOL done = FALSE;
+    while (ctx->GetData(_gpuvm_copy_query.get(), &done, sizeof(done), 0) == S_FALSE) {
+      if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(50)) {
+        _gpuvm_copy_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+      YieldProcessor();
+    }
+    const auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+    _gpuvm_copy_waits.fetch_add(1, std::memory_order_relaxed);
+    _gpuvm_copy_wait_us.fetch_add(us, std::memory_order_relaxed);
+    auto max = _gpuvm_copy_wait_max_us.load(std::memory_order_relaxed);
+    while (us > max && !_gpuvm_copy_wait_max_us.compare_exchange_weak(max, us, std::memory_order_relaxed)) {
+    }
+  }
+
   bool try_publish_directly(const winrt::com_ptr<ID3D11Texture2D> &frame_tex, uint64_t frame_qpc) {
     g_stage_cb = "cb:pub-delivery-mutex";
     std::unique_lock delivery_lock(_delivery_mutex);
@@ -1825,6 +1931,8 @@ private:
 
     g_stage_cb = "cb:pub-copy";
     _deps->d3d_context->CopyResource(_deps->resource_manager.get_shared_texture().get(), frame_tex.get());
+    g_stage_cb = "cb:pub-copy-wait";
+    wait_for_copy_on_gpu();
     g_stage_cb = "cb:pub-metadata";
     _deps->resource_manager.publish_frame_metadata(frame_qpc);
     g_stage_cb = "cb:pub-release";
@@ -1889,6 +1997,8 @@ private:
       std::lock_guard context_lock(_d3d_context_mutex);
       g_stage_cb = "cb:scratch-copy";
       _deps->d3d_context->CopyResource(_scratch_textures[*scratch_index].texture.get(), frame_tex.get());
+      g_stage_cb = "cb:scratch-copy-wait";
+      wait_for_copy_on_gpu();
     }
     g_stage_cb = "cb:scratch-enqueue";
 
@@ -2324,6 +2434,29 @@ std::filesystem::path get_roaming_log_directory() {
  */
 std::string get_temp_log_path() {
   if (auto roaming_dir = get_roaming_log_directory(); !roaming_dir.empty()) {
+    // GpuVM: one file per run in wgc-helper\, the newest 40 kept. Sunshine starts the helper ~10 times as a viewer
+    // opens (encoder probes), so the five generations of one shared file were gone within minutes and the log of a
+    // frozen session was lost before anyone read it (lab 057).
+    auto dir = roaming_dir / L"wgc-helper";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (!ec) {
+      std::vector<std::filesystem::path> old;
+      for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (entry.is_regular_file() && entry.path().extension() == L".log") {
+          old.push_back(entry.path());
+        }
+      }
+      std::sort(old.begin(), old.end());  // names start with the date and time
+      for (std::size_t i = 0; i + 39 < old.size(); ++i) {
+        std::filesystem::remove(old[i], ec);
+      }
+      SYSTEMTIME t;
+      GetLocalTime(&t);
+      const auto name = std::format(L"helper-{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}-{}.log", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
+                                    t.wSecond, t.wMilliseconds, GetCurrentProcessId());
+      return wide_to_utf8((dir / name).wstring());
+    }
     auto log_file = roaming_dir / L"sunshine_wgc_helper.log";
     return wide_to_utf8(log_file.wstring());
   }
@@ -2730,8 +2863,23 @@ int main(int argc, char *argv[]) {
   // GpuVM stall probe: logs where every thread is once frames stop for 2 s (lab 056).
   std::jthread stall_probe([](std::stop_token st) {
     int64_t last_report = 0;
+    // The capture broker's processes as the capture started: if they change, this helper's session died with the
+    // old one and the helper starts over (lab 057).
+    const auto broker_pids = gpuvm_capture_service_pids();
+    BOOST_LOG(info) << "GpuVM: capture broker (CaptureService) pid " << gpuvm_pids_text(broker_pids);
+    int ticks = 0;
     while (!st.stop_requested()) {
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      if (!broker_pids.empty() && ++ticks % 2 == 0) {
+        if (const auto now_pids = gpuvm_capture_service_pids(); now_pids != broker_pids) {
+          BOOST_LOG(warning) << "GpuVM: the capture broker (CaptureService) changed from pid " << gpuvm_pids_text(broker_pids)
+                             << " to " << gpuvm_pids_text(now_pids) << "; this capture is dead, restarting the helper";
+          boost::log::core::get()->flush();
+          g_capture_item_closed.store(true, std::memory_order_release);
+          std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+          TerminateProcess(GetCurrentProcess(), 4);
+        }
+      }
       const auto last = g_last_frame_ms.load();
       const auto now = gpuvm_now_ms();
       if (last && now - last > 2000 && now - last_report > 10000) {
