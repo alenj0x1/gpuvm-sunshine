@@ -1195,6 +1195,19 @@ private:
   std::atomic<uint64_t> _direct_published_frames {0};  ///< Frames copied straight into the shared texture.
   // GpuVM: the wait for each copy out of a WGC buffer to finish on the GPU before the buffer goes back (lab 057).
   winrt::com_ptr<ID3D11Query> _gpuvm_copy_query;
+  // GpuVM: the unfinished-frame check (copy_complete_frame).
+  static constexpr UINT FRAME_CHECK_MIP = 5;
+  struct frame_check_t {
+    int on = -1;
+    winrt::com_ptr<ID3D11Texture2D> tex, stage;
+    winrt::com_ptr<ID3D11ShaderResourceView> srv;
+    UINT w = 0, h = 0, mw = 0, mh = 0;
+    std::vector<uint8_t> alpha, reference;
+  } _check;
+  std::atomic<uint64_t> _check_finished {0};
+  std::atomic<uint64_t> _check_taken_as_is {0};
+  std::atomic<uint64_t> _check_wait_us {0};
+  std::atomic<uint64_t> _check_wait_max_us {0};
   std::atomic<uint64_t> _gpuvm_copy_waits {0};
   std::atomic<uint64_t> _gpuvm_copy_wait_us {0};
   std::atomic<uint64_t> _gpuvm_copy_wait_max_us {0};
@@ -1639,6 +1652,14 @@ private:
       BOOST_LOG(info) << "GpuVM copy wait: copies=" << waits << " avg_us=" << (waits ? wait_us / waits : 0)
                       << " max_us=" << _gpuvm_copy_wait_max_us.exchange(0, std::memory_order_relaxed)
                       << " timeouts=" << _gpuvm_copy_wait_timeouts.exchange(0, std::memory_order_relaxed);
+      {
+        const auto finished = _check_finished.exchange(0, std::memory_order_relaxed);
+        const auto as_is = _check_taken_as_is.exchange(0, std::memory_order_relaxed);
+        const auto waited = _check_wait_us.exchange(0, std::memory_order_relaxed);
+        BOOST_LOG(info) << "GpuVM unfinished frames: finished=" << finished << " taken_as_is=" << as_is
+                        << " avg_wait_us=" << ((finished + as_is) ? waited / (finished + as_is) : 0)
+                        << " max_wait_us=" << _check_wait_max_us.exchange(0, std::memory_order_relaxed);
+      }
       return;
     }
   }
@@ -1901,6 +1922,156 @@ private:
     }
   }
 
+  /**
+   * @brief GpuVM: copies a WGC frame into `dst` only once Windows has finished drawing it.
+   *
+   * On a GPU-P virtual display Windows can hand a frame over while its drawing is still running on the GPU. What
+   * changed is cleared to transparent black first and drawn after, so the encoder got black bands, wedges with
+   * stair-step edges or a whole black screen for one frame (lab 063: the helper's own copies had them, and the
+   * buffer kept changing after the copy; they matched the black flashes counted in the stream). A finished desktop
+   * frame is opaque, so blocks that come out transparent where the last frame was opaque mean it isn't finished:
+   * the frame is still held, so Windows finishes it in place; copy again every ~0.5 ms until it is, for at most
+   * 25 ms, then take it as it is, as the new reference (content that really is transparent, like some games, costs
+   * one wait, not one per frame). One extra mip chain on the GPU and ~2 KB read back per frame; the copy wait the
+   * helper already had covers it. Called with the context lock held.
+   */
+  void copy_complete_frame(ID3D11Texture2D *dst, ID3D11Texture2D *src) {
+    auto &ctx = _deps->d3d_context;
+    const bool check = prepare_frame_check(src);
+    ctx->CopyResource(dst, src);
+    if (check) {
+      queue_frame_check(src);
+    }
+    wait_for_copy_on_gpu();
+    if (!check) {
+      return;
+    }
+    size_t unfinished = read_frame_check();
+    if (unfinished == 0) {
+      _check.reference.swap(_check.alpha);
+      return;
+    }
+    const auto first = unfinished;
+    const auto start = std::chrono::steady_clock::now();
+    int copies = 1;
+    while (unfinished && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(25)) {
+      const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(500);
+      while (std::chrono::steady_clock::now() < until) {
+        std::this_thread::yield();
+      }
+      ctx->CopyResource(dst, src);
+      queue_frame_check(src);
+      wait_for_copy_on_gpu();
+      unfinished = read_frame_check();
+      ++copies;
+    }
+    const auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+    (unfinished ? _check_taken_as_is : _check_finished).fetch_add(1, std::memory_order_relaxed);
+    _check_wait_us.fetch_add(us, std::memory_order_relaxed);
+    auto max = _check_wait_max_us.load(std::memory_order_relaxed);
+    while (us > max && !_check_wait_max_us.compare_exchange_weak(max, us, std::memory_order_relaxed)) {
+    }
+    const auto n = _check_finished.load(std::memory_order_relaxed) + _check_taken_as_is.load(std::memory_order_relaxed);
+    if (n <= 20 || n % 100 == 0) {
+      BOOST_LOG(info) << "GpuVM: WGC frame handed over unfinished (" << first << " blocks transparent); "
+                      << (unfinished ? "taken as it is" : "finished") << " after " << us << " us, " << copies << " copies";
+    }
+    _check.reference.swap(_check.alpha);
+  }
+
+  /// The check's textures for this frame's size and format; false when the check is off or can't run.
+  bool prepare_frame_check(ID3D11Texture2D *src) {
+    if (_check.on == 0) {
+      return false;
+    }
+    if (_check.on < 0) {
+      _check.on = std::filesystem::exists(L"C:\\Program Files\\Sunshine\\tools\\gpuvm-frame-check-off.txt") ? 0 : 1;
+      BOOST_LOG(info) << "GpuVM: unfinished-frame check " << (_check.on ? "on" : "off");
+      if (!_check.on) {
+        return false;
+      }
+    }
+    D3D11_TEXTURE2D_DESC d {};
+    src->GetDesc(&d);
+    if (d.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+      // HDR (FP16) frames: not checked.
+      return false;
+    }
+    if (d.Width == _check.w && d.Height == _check.h && _check.tex) {
+      return true;
+    }
+    _check.tex = nullptr;
+    _check.srv = nullptr;
+    _check.stage = nullptr;
+    _check.reference.clear();
+    winrt::com_ptr<ID3D11Device> dev;
+    _deps->d3d_context->GetDevice(dev.put());
+    D3D11_TEXTURE2D_DESC t {};
+    t.Width = d.Width;
+    t.Height = d.Height;
+    t.MipLevels = FRAME_CHECK_MIP + 1;
+    t.ArraySize = 1;
+    t.Format = d.Format;
+    t.SampleDesc.Count = 1;
+    t.Usage = D3D11_USAGE_DEFAULT;
+    t.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    t.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    D3D11_TEXTURE2D_DESC s {};
+    s.Width = std::max(1u, d.Width >> FRAME_CHECK_MIP);
+    s.Height = std::max(1u, d.Height >> FRAME_CHECK_MIP);
+    s.MipLevels = 1;
+    s.ArraySize = 1;
+    s.Format = d.Format;
+    s.SampleDesc.Count = 1;
+    s.Usage = D3D11_USAGE_STAGING;
+    s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (!dev || FAILED(dev->CreateTexture2D(&t, nullptr, _check.tex.put())) ||
+        FAILED(dev->CreateShaderResourceView(_check.tex.get(), nullptr, _check.srv.put())) ||
+        FAILED(dev->CreateTexture2D(&s, nullptr, _check.stage.put()))) {
+      BOOST_LOG(warning) << "GpuVM: unfinished-frame check unavailable (couldn't create its textures)";
+      _check.on = 0;
+      return false;
+    }
+    _check.w = d.Width;
+    _check.h = d.Height;
+    _check.mw = s.Width;
+    _check.mh = s.Height;
+    return true;
+  }
+
+  /// Queues the check: the frame into mip 0, the mip chain, and the last mip (one texel per 32x32 block) to staging.
+  void queue_frame_check(ID3D11Texture2D *src) {
+    auto &ctx = _deps->d3d_context;
+    ctx->CopySubresourceRegion(_check.tex.get(), 0, 0, 0, 0, src, 0, nullptr);
+    ctx->GenerateMips(_check.srv.get());
+    ctx->CopySubresourceRegion(_check.stage.get(), 0, 0, 0, 0, _check.tex.get(), FRAME_CHECK_MIP, nullptr);
+  }
+
+  /// Blocks that came out transparent (alpha < 250) where the reference frame was opaque.
+  size_t read_frame_check() {
+    auto &ctx = _deps->d3d_context;
+    D3D11_MAPPED_SUBRESOURCE m {};
+    if (FAILED(ctx->Map(_check.stage.get(), 0, D3D11_MAP_READ, 0, &m))) {
+      return 0;
+    }
+    _check.alpha.resize(size_t(_check.mw) * _check.mh);
+    for (UINT y = 0; y < _check.mh; ++y) {
+      const auto row = static_cast<const uint8_t *>(m.pData) + size_t(y) * m.RowPitch;
+      for (UINT x = 0; x < _check.mw; ++x) {
+        _check.alpha[size_t(y) * _check.mw + x] = row[size_t(x) * 4 + 3];
+      }
+    }
+    ctx->Unmap(_check.stage.get(), 0);
+    const bool have_reference = _check.reference.size() == _check.alpha.size();
+    size_t n = 0;
+    for (size_t i = 0; i < _check.alpha.size(); ++i) {
+      if (_check.alpha[i] < 250 && (!have_reference || _check.reference[i] >= 250)) {
+        ++n;
+      }
+    }
+    return n;
+  }
+
   bool try_publish_directly(const winrt::com_ptr<ID3D11Texture2D> &frame_tex, uint64_t frame_qpc) {
     g_stage_cb = "cb:pub-delivery-mutex";
     std::unique_lock delivery_lock(_delivery_mutex);
@@ -1930,9 +2101,7 @@ private:
     }
 
     g_stage_cb = "cb:pub-copy";
-    _deps->d3d_context->CopyResource(_deps->resource_manager.get_shared_texture().get(), frame_tex.get());
-    g_stage_cb = "cb:pub-copy-wait";
-    wait_for_copy_on_gpu();
+    copy_complete_frame(_deps->resource_manager.get_shared_texture().get(), frame_tex.get());
     g_stage_cb = "cb:pub-metadata";
     _deps->resource_manager.publish_frame_metadata(frame_qpc);
     g_stage_cb = "cb:pub-release";
@@ -1996,9 +2165,7 @@ private:
       g_stage_cb = "cb:scratch-context-mutex";
       std::lock_guard context_lock(_d3d_context_mutex);
       g_stage_cb = "cb:scratch-copy";
-      _deps->d3d_context->CopyResource(_scratch_textures[*scratch_index].texture.get(), frame_tex.get());
-      g_stage_cb = "cb:scratch-copy-wait";
-      wait_for_copy_on_gpu();
+      copy_complete_frame(_scratch_textures[*scratch_index].texture.get(), frame_tex.get());
     }
     g_stage_cb = "cb:scratch-enqueue";
 

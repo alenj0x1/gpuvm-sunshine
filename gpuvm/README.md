@@ -38,6 +38,13 @@ The first commit after the upstream tag imports Vibeshine's files unmodified; th
   capture starts and starts over when it changes (picture back in about 2 s).
 - **Copy finished before the frame goes back.** Each copy out of a WGC buffer waits for the GPU (an event query, at
   most 50 ms) before the frame is released, so Windows doesn't draw the next frame into a buffer still being copied.
+- **Only finished frames.** On a GPU-P display Windows can hand a frame over while it is still drawing it: what
+  changed is cleared to transparent black and drawn after, and the stream showed black bands, wedges or a black screen
+  for one frame. A finished desktop frame is opaque, so each copy is checked on the GPU (a mip chain, ~2 KB read back);
+  blocks that turn transparent where the last frame was opaque mean it isn't finished, and the helper copies again
+  every 0.5 ms (the frame is still held, so Windows finishes it in place; usually within 1 ms), at most 25 ms. Content
+  that really is transparent (some games) is taken after that one wait and becomes the reference.
+  `tools\gpuvm-frame-check-off.txt` turns it off.
 - **One log per run.** `%APPDATA%\Sunshine\wgc-helper\helper-<date>-<pid>.log`, the newest 40 kept (Sunshine starts the
   helper several times while a viewer opens).
 

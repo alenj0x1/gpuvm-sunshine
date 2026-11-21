@@ -42,6 +42,13 @@ muestran cada cambio.
 - **Copia terminada antes de devolver el cuadro.** Cada copia desde un búfer de WGC espera a la GPU (una consulta de
   evento, 50 ms como máximo) antes de soltar el cuadro, para que Windows no dibuje el siguiente en un búfer que
   todavía se está copiando.
+- **Solo cuadros terminados.** En una pantalla con GPU-P Windows puede entregar un cuadro mientras todavía lo dibuja:
+  lo que cambió se limpia a negro transparente y se dibuja después, y el stream mostraba franjas, cuñas o la pantalla
+  negra durante un cuadro. Un cuadro de escritorio terminado es opaco, así que cada copia se revisa en la GPU (una
+  cadena de mipmaps, ~2 KB leídos); bloques que quedan transparentes donde el cuadro anterior era opaco indican que no
+  está terminado, y el ayudante vuelve a copiar cada 0,5 ms (el cuadro sigue retenido, así que Windows lo termina en
+  su lugar; casi siempre en menos de 1 ms), 25 ms como máximo. El contenido de verdad transparente (algunos juegos) se
+  toma tras esa única espera y pasa a ser la referencia. `tools\gpuvm-frame-check-off.txt` la desactiva.
 - **Un log por ejecución.** `%APPDATA%\Sunshine\wgc-helper\helper-<fecha>-<pid>.log`, se guardan los 40 más nuevos
   (Sunshine arranca el ayudante varias veces mientras se abre un visor).
 
