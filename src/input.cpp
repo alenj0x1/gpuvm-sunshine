@@ -438,6 +438,13 @@ namespace input {
       case 0x4E /* VKEY_N */:
         display_cursor = !display_cursor;
         return 1;
+      // GpuVM: the viewer hides the machine's cursor while an agent works (it draws the agent's own) and shows it again.
+      case 0x7D /* VKEY_F14 */:
+        display_cursor = false;
+        return 1;
+      case 0x7E /* VKEY_F15 */:
+        display_cursor = true;
+        return 1;
     }
 
     return 0;
