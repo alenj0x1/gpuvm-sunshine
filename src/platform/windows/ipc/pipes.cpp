@@ -805,7 +805,7 @@ namespace platf::dxgi {
       }
       handshake_attempted_ = true;
       // GpuVM: another process of the session's user that reached the pipe first is cut off here, before it hears
-      // the data pipe's name or gets the capture's configuration (security review, 2026-11-21).
+      // the data pipe's name or gets the capture's configuration.
       if (!peer_is_expected(control_.get())) {
         BOOST_LOG(error) << "Capture pipe: a process other than the helper connected; refused";
         control_->disconnect();
