@@ -701,6 +701,8 @@ namespace platf::dxgi {
 
     std::optional<DWORD> peer_process_id() override { auto *pipe = active_pipe(); return pipe ? pipe->peer_process_id() : std::nullopt; }
 
+    void expect_peer_process(DWORD pid) override { expected_peer_ = pid; }
+
   private:
     bool stop_requested() const {
       return stop_requested_ && stop_requested_();
@@ -802,6 +804,14 @@ namespace platf::dxgi {
         return;
       }
       handshake_attempted_ = true;
+      // GpuVM: another process of the session's user that reached the pipe first is cut off here, before it hears
+      // the data pipe's name or gets the capture's configuration (security review, 2026-11-21).
+      if (!peer_is_expected(control_.get())) {
+        BOOST_LOG(error) << "Capture pipe: a process other than the helper connected; refused";
+        control_->disconnect();
+        control_.reset();
+        return;
+      }
 
       std::string data_pipe_name = generate_guid();
       if (data_pipe_name.empty()) {
@@ -853,6 +863,14 @@ namespace platf::dxgi {
         return;
       }
 
+      if (!peer_is_expected(data_pipe.get())) {
+        BOOST_LOG(error) << "Capture data pipe: a process other than the helper connected; refused";
+        data_pipe->disconnect();
+        control_->disconnect();
+        control_.reset();
+        return;
+      }
+
       if (!buffered.empty()) {
         BOOST_LOG(warning) << "Discarding " << buffered.size()
                            << " byte(s) received alongside handshake ACK.";
@@ -862,11 +880,16 @@ namespace platf::dxgi {
       data_ = std::move(data_pipe);
     }
 
+    bool peer_is_expected(INamedPipe *pipe) const {
+      return expected_peer_ == 0 || (pipe && pipe->peer_process_id() == expected_peer_);
+    }
+
     std::unique_ptr<INamedPipe> control_;
     std::unique_ptr<INamedPipe> data_;
     NamedPipeFactory pipe_factory_;
     std::function<bool()> stop_requested_;
     bool handshake_attempted_ {false};
+    DWORD expected_peer_ {0};
   };
 
   namespace {

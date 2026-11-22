@@ -180,6 +180,10 @@ namespace platf::dxgi {
     // Capability admission requires the actual connected kernel pipe peer.
     // Older/custom transports fail closed instead of trusting payload PIDs.
     virtual std::optional<DWORD> peer_process_id() { return std::nullopt; }
+
+    // GpuVM: only this process may be on the other end (the helper Sunshine started). A server pipe that knows its
+    // peer drops any other client before it sends or reads anything. 0 = no expectation.
+    virtual void expect_peer_process(DWORD) {}
   };
 
   class FramedPipe: public INamedPipe {

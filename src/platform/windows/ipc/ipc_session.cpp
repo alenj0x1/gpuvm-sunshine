@@ -373,12 +373,21 @@ namespace platf::dxgi {
       return;
     }
 
+    // GpuVM: only the helper just started may talk to this pipe (any other process of the session's user is refused).
+    const DWORD helper_pid = GetProcessId(_process_helper->get_process_handle());
+    if (!helper_pid) {
+      BOOST_LOG(error) << "Couldn't read the WGC helper's process id; aborting";
+      _process_helper->terminate();
+      return;
+    }
+    control_pipe->expect_peer_process(helper_pid);
+
     control_pipe->wait_for_client_connection(5000);
     if (stop_requested()) {
       return;
     }
 
-    if (!control_pipe->is_connected()) {
+    if (!control_pipe->is_connected() || control_pipe->peer_process_id() != helper_pid) {
       BOOST_LOG(error) << "Helper failed to connect to control pipe within timeout";
       _process_helper->terminate();
       return;
